@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """ImageNet example.
 
 This script trains a ResNet-50 on the ImageNet dataset.
@@ -30,18 +29,19 @@ from flax.training import checkpoints
 from flax.training import common_utils
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
+from jax.sharding import NamedSharding, Mesh, PartitionSpec as P
 import jax
 from jax import lax
 import jax.numpy as jnp
 from jax import random
 import ml_collections
+import numpy as np
 import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
 
 import input_pipeline
 import models
-
 
 NUM_CLASSES = 1000
 
@@ -71,6 +71,9 @@ def initialized(key, image_size, model):
 
 def cross_entropy_loss(logits, labels):
   one_hot_labels = common_utils.onehot(labels, num_classes=NUM_CLASSES)
+  print(f"--- cross_entropy_loss Shapes ---")  # Debugging print
+  print(f"  Logits shape: {logits.shape}")
+  print(f"  one_hot_labels shape: {one_hot_labels.shape}")
   xentropy = optax.softmax_cross_entropy(logits=logits, labels=one_hot_labels)
   return jnp.mean(xentropy)
 
@@ -99,8 +102,8 @@ def create_learning_rate_fn(
   )
   cosine_epochs = max(config.num_epochs - config.warmup_epochs, 1)
   cosine_fn = optax.cosine_decay_schedule(
-      init_value=base_learning_rate, decay_steps=cosine_epochs * steps_per_epoch
-  )
+      init_value=base_learning_rate,
+      decay_steps=cosine_epochs * steps_per_epoch)
   schedule_fn = optax.join_schedules(
       schedules=[warmup_fn, cosine_fn],
       boundaries=[config.warmup_epochs * steps_per_epoch],
@@ -121,9 +124,7 @@ def train_step(state, batch, learning_rate_fn):
     loss = cross_entropy_loss(logits, batch['label'])
     weight_penalty_params = jax.tree_util.tree_leaves(params)
     weight_decay = 0.0001
-    weight_l2 = sum(
-        jnp.sum(x**2) for x in weight_penalty_params if x.ndim > 1
-    )
+    weight_l2 = sum(jnp.sum(x**2) for x in weight_penalty_params if x.ndim > 1)
     weight_penalty = weight_decay * 0.5 * weight_l2
     loss = loss + weight_penalty
     return loss, (new_model_state, logits)
@@ -134,8 +135,7 @@ def train_step(state, batch, learning_rate_fn):
 
   if dynamic_scale:
     grad_fn = dynamic_scale.value_and_grad(
-        loss_fn, has_aux=True, axis_name='batch'
-    )
+        loss_fn, has_aux=True, axis_name='batch')
     dynamic_scale, is_fin, aux, grads = grad_fn(state.params)
     # dynamic loss takes care of averaging gradients across replicas
   else:
@@ -161,8 +161,8 @@ def train_step(state, batch, learning_rate_fn):
             state.opt_state,
         ),
         params=jax.tree_util.tree_map(
-            functools.partial(jnp.where, is_fin), new_state.params, state.params
-        ),
+            functools.partial(jnp.where, is_fin), new_state.params,
+            state.params),
         dynamic_scale=dynamic_scale,
     )
     metrics['scale'] = dynamic_scale.scale
@@ -200,6 +200,8 @@ def create_input_iter(
     cache,
     shuffle_buffer_size,
     prefetch,
+    batch_sharding,
+    mesh,
 ):
   ds = input_pipeline.create_split(
       dataset_builder,
@@ -212,8 +214,24 @@ def create_input_iter(
       prefetch=prefetch,
   )
   it = map(prepare_tf_data, ds)
-  it = jax_utils.prefetch_to_device(it, 2)
-  return it
+  it_numpy = jax_utils.prefetch_to_device(it, 2)
+
+  def _shard_batch(batch, batch_sharding, mesh):  # Function to shard the batch
+    mesh_devices = mesh.devices.reshape((-1,))  # Flatten mesh.devices to a 1D list of devices
+
+    def shard_item(x, devices):
+      num_devices = devices.shape[0]
+      shards = list(x.reshape(num_devices, -1, *x.shape[1:]))  # Create shards
+      return jax.device_put_sharded(shards, devices=devices)  # Correct API: shards, devices
+
+    shard_item_partial = functools.partial(shard_item, devices=mesh_devices) # Fix: Pass devices here
+    return jax.tree_util.tree_map(shard_item_partial, batch)
+
+
+  _shard_batch_partial = functools.partial(_shard_batch, batch_sharding=batch_sharding, mesh=mesh) # Fix: Pass batch_sharding and mesh here
+  it_sharded = map(_shard_batch_partial, it_numpy)  # Apply sharding to the iterator
+  return it_sharded
+
 
 
 class TrainState(train_state.TrainState):
@@ -231,9 +249,8 @@ def save_checkpoint(state, workdir):
   checkpoints.save_checkpoint_multiprocess(workdir, state, step, keep=3)
 
 
-def create_train_state(
-    rng, config: ml_collections.ConfigDict, model, image_size, learning_rate_fn
-):
+def create_train_state(rng, config: ml_collections.ConfigDict, model,
+                       image_size, learning_rate_fn, mesh):
   """Create initial training state."""
   dynamic_scale = None
   platform = jax.local_devices()[0].platform
@@ -242,25 +259,25 @@ def create_train_state(
   else:
     dynamic_scale = None
 
-  params, batch_stats = initialized(rng, image_size, model)
-  tx = optax.sgd(
-      learning_rate=learning_rate_fn,
-      momentum=config.momentum,
-      nesterov=True,
-  )
-  state = TrainState.create(
-      apply_fn=model.apply,
-      params=params,
-      tx=tx,
-      batch_stats=batch_stats,
-      dynamic_scale=dynamic_scale,
+  with mesh:
+    params, batch_stats = initialized(rng, image_size, model)
+    tx = optax.sgd(
+        learning_rate=learning_rate_fn,
+        momentum=config.momentum,
+        nesterov=True,
+    )
+    state = TrainState.create(
+        apply_fn=model.apply,
+        params=params,
+        tx=tx,
+        batch_stats=batch_stats,
+        dynamic_scale=dynamic_scale,
   )
   return state
 
 
-def train_and_evaluate(
-    config: ml_collections.ConfigDict, workdir: str
-) -> TrainState:
+def train_and_evaluate(config: ml_collections.ConfigDict,
+                       workdir: str) -> TrainState:
   """Execute model training and evaluation loop.
 
   Args:
@@ -272,8 +289,7 @@ def train_and_evaluate(
   """
 
   writer = metric_writers.create_default_writer(
-      logdir=workdir, just_logging=jax.process_index() != 0
-  )
+      logdir=workdir, just_logging=jax.process_index() != 0)
 
   rng = random.key(0)
 
@@ -284,6 +300,17 @@ def train_and_evaluate(
   local_batch_size = config.batch_size // jax.process_count()
 
   platform = jax.local_devices()[0].platform
+
+  num_devices = jax.device_count()
+  if num_devices == 0:
+      raise ValueError("No devices found. JAX needs at least one device.")
+  available_devices = jax.devices()
+  mesh_shape = (num_devices,)  # 1-dimensional mesh shape (for 1D mesh)
+  device_array = np.array(available_devices).reshape(mesh_shape)  # Reshape to 1D
+  mesh: Mesh = Mesh(device_array, axis_names=('batch',))  # axis_names = ('batch',) - length 1, matching device_array.ndim=1
+  replicated_sharding = NamedSharding(mesh, P())
+  batch_sharding = NamedSharding(mesh, P('batch',))
+
 
   if config.half_precision:
     if platform == 'tpu':
@@ -303,6 +330,8 @@ def train_and_evaluate(
       cache=config.cache,
       shuffle_buffer_size=config.shuffle_buffer_size,
       prefetch=config.prefetch,
+      batch_sharding=batch_sharding,
+      mesh=mesh, # Pass mesh here
   )
   eval_iter = create_input_iter(
       dataset_builder,
@@ -313,11 +342,12 @@ def train_and_evaluate(
       cache=config.cache,
       shuffle_buffer_size=None,
       prefetch=config.prefetch,
+      batch_sharding=batch_sharding,
+      mesh=mesh, # Pass mesh here
   )
 
   steps_per_epoch = (
-      dataset_builder.info.splits['train'].num_examples // config.batch_size
-  )
+      dataset_builder.info.splits['train'].num_examples // config.batch_size)
 
   if config.num_train_steps <= 0:
     num_steps = int(steps_per_epoch * config.num_epochs)
@@ -326,8 +356,7 @@ def train_and_evaluate(
 
   if config.steps_per_eval == -1:
     num_validation_examples = dataset_builder.info.splits[
-        'validation'
-    ].num_examples
+        'validation'].num_examples
     steps_per_eval = num_validation_examples // config.batch_size
   else:
     steps_per_eval = config.steps_per_eval
@@ -338,82 +367,76 @@ def train_and_evaluate(
 
   model_cls = getattr(models, config.model)
   model = create_model(
-      model_cls=model_cls, half_precision=config.half_precision
-  )
+      model_cls=model_cls, half_precision=config.half_precision)
 
-  learning_rate_fn = create_learning_rate_fn(
-      config, base_learning_rate, steps_per_epoch
-  )
+  learning_rate_fn = create_learning_rate_fn(config, base_learning_rate,
+                                             steps_per_epoch)
+  with mesh:
+    state = create_train_state(rng, config, model, image_size, learning_rate_fn, mesh)
+    state = restore_checkpoint(state, workdir)
+    # step_offset > 0 if restarting from checkpoint
+    step_offset = int(state.step)
+    pjit_train_step = jax.jit(
+        functools.partial(train_step, learning_rate_fn=learning_rate_fn),
+        in_shardings=(replicated_sharding, batch_sharding),
+        out_shardings=(replicated_sharding, replicated_sharding))
+    pjit_eval_step = jax.jit(
+        eval_step,
+        in_shardings=(replicated_sharding, batch_sharding),
+        out_shardings=replicated_sharding)
 
-  state = create_train_state(rng, config, model, image_size, learning_rate_fn)
-  state = restore_checkpoint(state, workdir)
-  # step_offset > 0 if restarting from checkpoint
-  step_offset = int(state.step)
+    train_metrics = []
+    hooks = []
+    if jax.process_index() == 0 and config.profile:
+      hooks += [
+          periodic_actions.Profile(
+              num_profile_steps=3, profile_duration_ms=None, logdir=workdir)
+      ]
+    train_metrics_last_t = time.time()
+    logging.info('Initial compilation, this might take some minutes...')
+    for step, batch in zip(range(step_offset, num_steps), train_iter):
+      state, metrics = pjit_train_step(state, batch)
+      for h in hooks:
+        h(step)
+      if step == step_offset:
+        logging.info('Initial compilation completed.')
 
-  p_train_step = jax.pmap(
-      functools.partial(train_step, learning_rate_fn=learning_rate_fn),
-      in_axes=(None, 0),
-      out_axes=(None, 0),
-      axis_name='batch',
-  )
-  p_eval_step = jax.pmap(eval_step, in_axes=(None, 0), axis_name='batch')
+      if config.get('log_every_steps'):
+        train_metrics.append(metrics)
+        if (step + 1) % config.log_every_steps == 0:
+          train_metrics = common_utils.get_metrics(train_metrics)
+          summary = {
+              f'train_{k}': v for k, v in jax.tree_util.tree_map(
+                  lambda x: x.mean(), train_metrics).items()
+          }
+          summary['steps_per_second'] = config.log_every_steps / (
+              time.time() - train_metrics_last_t)
+          writer.write_scalars(step + 1, summary)
+          train_metrics = []
+          train_metrics_last_t = time.time()
 
-  train_metrics = []
-  hooks = []
-  if jax.process_index() == 0 and config.profile:
-    hooks += [
-        periodic_actions.Profile(
-            num_profile_steps=3, profile_duration_ms=None, logdir=workdir
+      if (step + 1) % steps_per_epoch == 0:
+        epoch = step // steps_per_epoch
+        eval_metrics = []
+
+        for _ in range(steps_per_eval):
+          eval_batch = next(eval_iter)
+          metrics = pjit_eval_step(state, eval_batch)
+          eval_metrics.append(metrics)
+        eval_metrics = common_utils.get_metrics(eval_metrics)
+        summary = jax.tree_util.tree_map(lambda x: x.mean(), eval_metrics)
+        logging.info(
+            'eval epoch: %d, loss: %.4f, accuracy: %.2f',
+            epoch,
+            summary['loss'],
+            summary['accuracy'] * 100,
         )
-    ]
-  train_metrics_last_t = time.time()
-  logging.info('Initial compilation, this might take some minutes...')
-  for step, batch in zip(range(step_offset, num_steps), train_iter):
-    state, metrics = p_train_step(state, batch)
-    for h in hooks:
-      h(step)
-    if step == step_offset:
-      logging.info('Initial compilation completed.')
-
-    if config.get('log_every_steps'):
-      train_metrics.append(metrics)
-      if (step + 1) % config.log_every_steps == 0:
-        train_metrics = common_utils.get_metrics(train_metrics)
-        summary = {
-            f'train_{k}': v
-            for k, v in jax.tree_util.tree_map(
-                lambda x: x.mean(), train_metrics
-            ).items()
-        }
-        summary['steps_per_second'] = config.log_every_steps / (
-            time.time() - train_metrics_last_t
-        )
-        writer.write_scalars(step + 1, summary)
-        train_metrics = []
-        train_metrics_last_t = time.time()
-
-    if (step + 1) % steps_per_epoch == 0:
-      epoch = step // steps_per_epoch
-      eval_metrics = []
-
-      for _ in range(steps_per_eval):
-        eval_batch = next(eval_iter)
-        metrics = p_eval_step(state, eval_batch)
-        eval_metrics.append(metrics)
-      eval_metrics = common_utils.get_metrics(eval_metrics)
-      summary = jax.tree_util.tree_map(lambda x: x.mean(), eval_metrics)
-      logging.info(
-          'eval epoch: %d, loss: %.4f, accuracy: %.2f',
-          epoch,
-          summary['loss'],
-          summary['accuracy'] * 100,
-      )
-      writer.write_scalars(
-          step + 1, {f'eval_{key}': val for key, val in summary.items()}
-      )
-      writer.flush()
-    if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
-      save_checkpoint(state, workdir)
+        writer.write_scalars(step + 1, {
+            f'eval_{key}': val for key, val in summary.items()
+        })
+        writer.flush()
+      if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
+        save_checkpoint(state, workdir)
 
   # Wait until computations are done before exiting
   jax.random.normal(jax.random.key(0), ()).block_until_ready()
