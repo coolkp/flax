@@ -72,7 +72,9 @@ def initialized(key, image_size, model):
 
 def cross_entropy_loss(logits, labels):
   one_hot_labels = common_utils.onehot(labels, num_classes=NUM_CLASSES)
+  breakpoint()
   xentropy = optax.softmax_cross_entropy(logits=logits, labels=one_hot_labels)
+  breakpoint()
   return jnp.mean(xentropy)
 
 

@@ -107,7 +107,7 @@ class ResNet(nn.Module):
         momentum=0.9,
         epsilon=1e-5,
         dtype=self.dtype,
-        axis_name='batch',
+        # axis_name='batch',
     )
 
     x = conv(
