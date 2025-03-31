@@ -185,7 +185,7 @@ def preprocess_for_eval(image_bytes, dtype=tf.float32, image_size=IMAGE_SIZE):
 
 
 def create_split(
-    dataset_builder,
+    dataset_builder:tfds.core.DatasetBuilder,
     batch_size,
     train,
     dtype=tf.float32,
@@ -226,7 +226,7 @@ def create_split(
       image = preprocess_for_eval(example['image'], dtype, image_size)
     return {'image': image, 'label': example['label']}
 
-  ds = dataset_builder.as_dataset(
+  ds:tf.data.Dataset = dataset_builder.as_dataset(
       split=split,
       decoders={
           'image': tfds.decode.SkipDecoding(),
@@ -234,7 +234,7 @@ def create_split(
   )
   options = tf.data.Options()
   options.experimental_threading.private_threadpool_size = 48
-  ds = ds.with_options(options)
+  ds:tf.data.Dataset = ds.with_options(options)
 
   if cache:
     ds = ds.cache()

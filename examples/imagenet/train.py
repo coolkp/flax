@@ -31,7 +31,8 @@ from flax.training import common_utils
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training import train_state
 import jax
-from jax import lax
+from jax import lax, make_mesh
+from jax.sharding import Mesh, PartitionSpec, NamedSharding
 import jax.numpy as jnp
 from jax import random
 import ml_collections
@@ -180,7 +181,7 @@ def prepare_tf_data(xs):
   """Convert a input batch from tf Tensors to numpy arrays."""
   local_device_count = jax.local_device_count()
 
-  def _prepare(x):
+  def _prepare(x:tf.Tensor):
     # Use _numpy() for zero-copy conversion between TF and NumPy.
     x = x._numpy()  # pylint: disable=protected-access
 
@@ -188,12 +189,12 @@ def prepare_tf_data(xs):
     # (local_devices, device_batch_size, height, width, 3)
     return x.reshape((local_device_count, -1) + x.shape[1:])
 
-  return jax.tree_util.tree_map(_prepare, xs)
+  return jax.tree.map(_prepare, xs)
 
 
 def create_input_iter(
-    dataset_builder,
-    batch_size,
+    dataset_builder:tfds.core.DatasetBuilder,
+    host_batch_size,
     image_size,
     dtype,
     train,
@@ -201,9 +202,12 @@ def create_input_iter(
     shuffle_buffer_size,
     prefetch,
 ):
+  
+  # data set chunk in context of current process/host index.
+  # jax.process_index
   ds = input_pipeline.create_split(
       dataset_builder,
-      batch_size,
+      host_batch_size,
       image_size=image_size,
       dtype=dtype,
       train=train,
@@ -211,8 +215,14 @@ def create_input_iter(
       shuffle_buffer_size=shuffle_buffer_size,
       prefetch=prefetch,
   )
+  
+  # reshape (host_batch_size, height, width, 3) to
+  # (local_devices, device_batch_size, height, width, 3)
+  # host_batch_size = local_devices * device_batch_size
   it = map(prepare_tf_data, ds)
-  it = jax_utils.prefetch_to_device(it, 2)
+  # eager prefetch each per device batch
+  it = jax_utils.prefetch_to_device(it, 2, jax.local_devices())
+  logging.info(f"[Process {jax.process_index()}] Returning prefetched iterator.")
   return it
 
 
@@ -257,6 +267,44 @@ def create_train_state(
   )
   return state
 
+def create_device_mesh(num_devices: int | None = None) -> Mesh:
+  """Creates a 1D batch-parallel mesh using jax.make_mesh.
+
+  Args:
+    num_devices: The total number of devices to use for the mesh dimension.
+      If None, uses all available devices.
+
+  Returns:
+    A jax.sharding.Mesh object configured for 1D batch parallelism.
+
+  Raises:
+      ValueError: If num_devices requested exceeds available devices.
+  """
+  available_devices = jax.device_count()
+
+  if num_devices is None:
+    mesh_size = available_devices
+    logging.info('Creating mesh with all available devices: %d', mesh_size)
+  elif num_devices > available_devices:
+       raise ValueError(
+           f"Requested num_devices ({num_devices}) exceeds the number of "
+           f"available devices ({available_devices})."
+       )
+  else:
+       mesh_size = num_devices
+       logging.info('Creating mesh with %d devices.', mesh_size)
+
+  axis_shapes, axis_names = (mesh_size,), ('batch',)
+
+  # Create the mesh using jax.make_mesh
+  # It automatically selects the devices (up to mesh_size) and arranges them.
+  mesh = make_mesh(axis_shapes, axis_names)
+
+  logging.info('Created mesh: %s with devices: %s', mesh, mesh.devices)
+  return mesh
+
+  
+
 
 def train_and_evaluate(
     config: ml_collections.ConfigDict, workdir: str
@@ -292,7 +340,9 @@ def train_and_evaluate(
       input_dtype = tf.float16
   else:
     input_dtype = tf.float32
-
+    
+  mesh = create_device_mesh()
+  
   dataset_builder = tfds.builder(config.dataset)
   train_iter = create_input_iter(
       dataset_builder,
@@ -349,71 +399,82 @@ def train_and_evaluate(
   state = restore_checkpoint(state, workdir)
   # step_offset > 0 if restarting from checkpoint
   step_offset = int(state.step)
-
-  p_train_step = jax.pmap(
+  with mesh:
+    p_train_step = jax.pmap(
+        functools.partial(train_step, learning_rate_fn=learning_rate_fn),
+        in_axes=(None, 0),
+        out_axes=(None, 0),
+        axis_name='batch',
+    )
+    pjit_train_step = jax.jit(
       functools.partial(train_step, learning_rate_fn=learning_rate_fn),
-      in_axes=(None, 0),
-      out_axes=(None, 0),
-      axis_name='batch',
-  )
-  p_eval_step = jax.pmap(eval_step, in_axes=(None, 0), axis_name='batch')
+      in_shardings=(None, NamedSharding(mesh,PartitionSpec('batch'))),
+      out_shardings=(None, None),
+    )
+    pjit_eval_step = jax.jit(
+      eval_step,
+      in_shardings=(None, NamedSharding(mesh,PartitionSpec('batch'))),
+      out_shardings=None,
+    )
+    p_eval_step = jax.pmap(eval_step, in_axes=(None, 0), axis_name='batch')
+    p_eval_step = pjit_eval_step
+    p_train_step = pjit_train_step
+    train_metrics = []
+    hooks = []
+    if jax.process_index() == 0 and config.profile:
+      hooks += [
+          periodic_actions.Profile(
+              num_profile_steps=3, profile_duration_ms=None, logdir=workdir
+          )
+      ]
+      train_metrics_last_t = time.time()
+      logging.info('Initial compilation, this might take some minutes...')
+      for step, batch in zip(range(step_offset, num_steps), train_iter):
+        state, metrics = pjit_train_step(state, batch)
+        for h in hooks:
+          h(step)
+        if step == step_offset:
+          logging.info('Initial compilation completed.')
 
-  train_metrics = []
-  hooks = []
-  if jax.process_index() == 0 and config.profile:
-    hooks += [
-        periodic_actions.Profile(
-            num_profile_steps=3, profile_duration_ms=None, logdir=workdir
-        )
-    ]
-  train_metrics_last_t = time.time()
-  logging.info('Initial compilation, this might take some minutes...')
-  for step, batch in zip(range(step_offset, num_steps), train_iter):
-    state, metrics = p_train_step(state, batch)
-    for h in hooks:
-      h(step)
-    if step == step_offset:
-      logging.info('Initial compilation completed.')
+        if config.get('log_every_steps'):
+          train_metrics.append(metrics)
+          if (step + 1) % config.log_every_steps == 0:
+            train_metrics = common_utils.get_metrics(train_metrics)
+            summary = {
+                f'train_{k}': v
+                for k, v in jax.tree_util.tree_map(
+                    lambda x: x.mean(), train_metrics
+                ).items()
+            }
+            summary['steps_per_second'] = config.log_every_steps / (
+                time.time() - train_metrics_last_t
+            )
+            writer.write_scalars(step + 1, summary)
+            train_metrics = []
+            train_metrics_last_t = time.time()
 
-    if config.get('log_every_steps'):
-      train_metrics.append(metrics)
-      if (step + 1) % config.log_every_steps == 0:
-        train_metrics = common_utils.get_metrics(train_metrics)
-        summary = {
-            f'train_{k}': v
-            for k, v in jax.tree_util.tree_map(
-                lambda x: x.mean(), train_metrics
-            ).items()
-        }
-        summary['steps_per_second'] = config.log_every_steps / (
-            time.time() - train_metrics_last_t
-        )
-        writer.write_scalars(step + 1, summary)
-        train_metrics = []
-        train_metrics_last_t = time.time()
+        if (step + 1) % steps_per_epoch == 0:
+          epoch = step // steps_per_epoch
+          eval_metrics = []
 
-    if (step + 1) % steps_per_epoch == 0:
-      epoch = step // steps_per_epoch
-      eval_metrics = []
-
-      for _ in range(steps_per_eval):
-        eval_batch = next(eval_iter)
-        metrics = p_eval_step(state, eval_batch)
-        eval_metrics.append(metrics)
-      eval_metrics = common_utils.get_metrics(eval_metrics)
-      summary = jax.tree_util.tree_map(lambda x: x.mean(), eval_metrics)
-      logging.info(
-          'eval epoch: %d, loss: %.4f, accuracy: %.2f',
-          epoch,
-          summary['loss'],
-          summary['accuracy'] * 100,
-      )
-      writer.write_scalars(
-          step + 1, {f'eval_{key}': val for key, val in summary.items()}
-      )
-      writer.flush()
-    if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
-      save_checkpoint(state, workdir)
+          for _ in range(steps_per_eval):
+            eval_batch = next(eval_iter)
+            metrics = pjit_eval_step(state, eval_batch)
+            eval_metrics.append(metrics)
+          eval_metrics = common_utils.get_metrics(eval_metrics)
+          summary = jax.tree_util.tree_map(lambda x: x.mean(), eval_metrics)
+          logging.info(
+              'eval epoch: %d, loss: %.4f, accuracy: %.2f',
+              epoch,
+              summary['loss'],
+              summary['accuracy'] * 100,
+          )
+          writer.write_scalars(
+              step + 1, {f'eval_{key}': val for key, val in summary.items()}
+          )
+          writer.flush()
+        if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
+          save_checkpoint(state, workdir)
 
   # Wait until computations are done before exiting
   jax.random.normal(jax.random.key(0), ()).block_until_ready()
