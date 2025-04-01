@@ -45,6 +45,8 @@ import tensorflow_datasets as tfds
 import input_pipeline
 import models
 
+import orbax.checkpoint as ocp
+from flax.training import orbax_utils
 
 NUM_CLASSES = 1000
 
@@ -92,8 +94,6 @@ def compute_metrics(logits, labels):
       'loss': loss,
       'accuracy': accuracy,
   }
-  # metrics = lax.pmean(metrics, axis_name='batch')
-  # metrics = metrics.mean()
   return metrics
 
 
@@ -122,7 +122,7 @@ def create_learning_rate_fn(
 def train_step(state, batch, learning_rate_fn):
   """Perform a single training step."""
   def print_sharding_info(x):
-      print(f"✅ [Method 2] Detailed sharding info for batch['image']:\n{x}")
+      print(f"✅ Detailed sharding info for batch['image']:\n{x}")
   jax.debug.inspect_array_sharding(batch['image'], callback=print_sharding_info)
   def loss_fn(params):
     """loss function used for training."""
@@ -331,7 +331,7 @@ def train_and_evaluate(
   rng = random.key(0)
 
   image_size = 224
-
+  mesh = create_device_mesh()
   if config.batch_size % jax.device_count() > 0:
     raise ValueError('Batch size must be divisible by the number of devices')
   local_batch_size = config.batch_size // jax.process_count()
@@ -399,10 +399,28 @@ def train_and_evaluate(
   )
 
   state = create_train_state(rng, config, model, image_size, learning_rate_fn)
-  state = restore_checkpoint(state, workdir)
+  # orbax checkpointing
+  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+  mngr = ocp.CheckpointManager(
+      workdir, options=options
+  )
+  restore_args = orbax_utils.restore_args_from_target(mesh, state)
+  latest_step = mngr.latest_step()
+  if latest_step is not None:
+      logging.info('Restoring checkpoint from step %d', latest_step)
+      state = mngr.restore(
+          latest_step,
+          args=ocp.args.StandardRestore(state),
+          restore_kwargs={'restore_args': restore_args}
+      )
+  # state = restore_checkpoint(state, workdir)
   # step_offset > 0 if restarting from checkpoint
   step_offset = int(state.step)
-  mesh = create_device_mesh()
+  if step_offset < 0:
+      logging.warning('Found negative step offset %d, resetting to 0.', step_offset)
+      step_offset = 0
+      
+  # train
   with mesh:
     p_train_step = jax.jit(
       functools.partial(train_step, learning_rate_fn=learning_rate_fn),
@@ -470,10 +488,16 @@ def train_and_evaluate(
               step + 1, {f'eval_{key}': val for key, val in summary.items()}
           )
           writer.flush()
+          
+        # === Orbax Checkpoint Saving ===
         if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
-          save_checkpoint(state, workdir)
-
+          # save_checkpoint(state, workdir)
+          save_step = step + 1
+          save_args = orbax_utils.save_args_from_target(state)
+          logging.info('Saving checkpoint step %d.', save_step)
+          mngr.save(save_step, args=ocp.args.StandardSave(state), save_kwargs={'save_args': save_args})
+          mngr.wait_until_finished() # Wait for async save to complete
   # Wait until computations are done before exiting
   jax.random.normal(jax.random.key(0), ()).block_until_ready()
-
+  mngr.close()
   return state
