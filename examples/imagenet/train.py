@@ -404,7 +404,7 @@ def train_and_evaluate(
   mngr = ocp.CheckpointManager(
       workdir, options=options
   )
-  restore_args = orbax_utils.restore_args_from_target(mesh, state)
+  restore_args = orbax_utils.restore_args_from_target(mesh=mesh, state=state)
   latest_step = mngr.latest_step()
   if latest_step is not None:
       logging.info('Restoring checkpoint from step %d', latest_step)
