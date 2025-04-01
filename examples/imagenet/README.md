@@ -72,7 +72,7 @@ python main.py --workdir=./imagenet_default --config=configs/default.py \
 Execute the following code with `flax/examples/imagenet` as your current directory:
 ```shell
 bash ../../tests/download_dataset_metadata.sh
-python imagenet_fake_data_benchmark.py
+JAX_PLATFORMS=tpu python imagenet_fake_data_benchmark.py
 ```
 
 If you get an error like this:

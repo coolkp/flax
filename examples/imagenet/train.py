@@ -388,40 +388,40 @@ def train_and_evaluate(
   steps_per_checkpoint = steps_per_epoch * 10
 
   base_learning_rate = config.learning_rate * config.batch_size / 256.0
-
-  model_cls = getattr(models, config.model)
-  model = create_model(
-      model_cls=model_cls, half_precision=config.half_precision
-  )
-
-  learning_rate_fn = create_learning_rate_fn(
-      config, base_learning_rate, steps_per_epoch
-  )
-
-  state = create_train_state(rng, config, model, image_size, learning_rate_fn)
-  # orbax checkpointing
-  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
-  mngr = ocp.CheckpointManager(
-      workdir, options=options
-  )
-  restore_args = orbax_utils.restore_args_from_target(mesh=mesh, state=state)
-  latest_step = mngr.latest_step()
-  if latest_step is not None:
-      logging.info('Restoring checkpoint from step %d', latest_step)
-      state = mngr.restore(
-          latest_step,
-          args=ocp.args.StandardRestore(state),
-          restore_kwargs={'restore_args': restore_args}
-      )
-  # state = restore_checkpoint(state, workdir)
-  # step_offset > 0 if restarting from checkpoint
-  step_offset = int(state.step)
-  if step_offset < 0:
-      logging.warning('Found negative step offset %d, resetting to 0.', step_offset)
-      step_offset = 0
-      
-  # train
   with mesh:
+    model_cls = getattr(models, config.model)
+    model = create_model(
+        model_cls=model_cls, half_precision=config.half_precision
+    )
+
+    learning_rate_fn = create_learning_rate_fn(
+        config, base_learning_rate, steps_per_epoch
+    )
+    
+    state = create_train_state(rng, config, model, image_size, learning_rate_fn)
+    # orbax checkpointing
+    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+    mngr = ocp.CheckpointManager(
+        workdir, options=options
+    )
+    restore_args = orbax_utils.restore_args_from_target(target=state)
+    latest_step = mngr.latest_step()
+    if latest_step is not None:
+        logging.info('Restoring checkpoint from step %d', latest_step)
+        state = mngr.restore(
+            latest_step,
+            args=ocp.args.StandardRestore(state),
+            restore_kwargs={'restore_args': restore_args}
+        )
+    # state = restore_checkpoint(state, workdir)
+    # step_offset > 0 if restarting from checkpoint
+    step_offset = int(state.step)
+    if step_offset < 0:
+        logging.warning('Found negative step offset %d, resetting to 0.', step_offset)
+        step_offset = 0
+        
+    # train
+    # with mesh:
     p_train_step = jax.jit(
       functools.partial(train_step, learning_rate_fn=learning_rate_fn),
       in_shardings=(None, NamedSharding(mesh,PartitionSpec('batch'))),
