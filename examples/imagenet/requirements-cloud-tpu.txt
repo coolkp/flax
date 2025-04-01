@@ -1,0 +1,11 @@
+absl-py
+clu
+flax
+ml-collections
+numpy
+optax
+tensorflow
+tensorflow-datasets
+jax[tpu]
+jax
+orbax-checkpoint
