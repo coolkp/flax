@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 """ImageNet example.
 
 This script trains a ResNet-50 on the ImageNet dataset.
@@ -41,6 +40,7 @@ import ml_collections
 import optax
 import tensorflow as tf
 import tensorflow_datasets as tfds
+from jax.experimental import multihost_utils
 
 import input_pipeline
 import models
@@ -49,6 +49,7 @@ import orbax.checkpoint as ocp
 from flax.training import orbax_utils
 
 NUM_CLASSES = 1000
+
 
 def create_model(*, model_cls, half_precision, **kwargs):
   platform = jax.local_devices()[0].platform
@@ -72,6 +73,7 @@ def initialized(key, image_size, model):
   variables = init({'params': key}, jnp.ones(input_shape, model.dtype))
   return variables['params'], variables['batch_stats']
 
+
 # Pmap values
 # > return jnp.mean(xentropy)
 # (Pdb) one_hot_labels.shape
@@ -80,7 +82,7 @@ def initialized(key, image_size, model):
 # (256, 1000)
 # (Pdb) labels.shape
 # (256,)
-# (Pdb) 
+# (Pdb)
 def cross_entropy_loss(logits, labels):
   one_hot_labels = common_utils.onehot(labels, num_classes=NUM_CLASSES)
   xentropy = optax.softmax_cross_entropy(logits=logits, labels=one_hot_labels)
@@ -110,8 +112,8 @@ def create_learning_rate_fn(
   )
   cosine_epochs = max(config.num_epochs - config.warmup_epochs, 1)
   cosine_fn = optax.cosine_decay_schedule(
-      init_value=base_learning_rate, decay_steps=cosine_epochs * steps_per_epoch
-  )
+      init_value=base_learning_rate,
+      decay_steps=cosine_epochs * steps_per_epoch)
   schedule_fn = optax.join_schedules(
       schedules=[warmup_fn, cosine_fn],
       boundaries=[config.warmup_epochs * steps_per_epoch],
@@ -121,22 +123,26 @@ def create_learning_rate_fn(
 
 def train_step(state, batch, learning_rate_fn):
   """Perform a single training step."""
+
   def print_sharding_info(x):
-      print(f"✅ Detailed sharding info for batch['image']:\n{x}")
+    print(f"✅ Detailed sharding info for batch['image']:\n{x}")
+
   jax.debug.inspect_array_sharding(batch['image'], callback=print_sharding_info)
+
   def loss_fn(params):
     """loss function used for training."""
     logits, new_model_state = state.apply_fn(
-        {'params': params, 'batch_stats': state.batch_stats},
+        {
+            'params': params,
+            'batch_stats': state.batch_stats
+        },
         batch['image'],
         mutable=['batch_stats'],
     )
     loss = cross_entropy_loss(logits, batch['label'])
     weight_penalty_params = jax.tree_util.tree_leaves(params)
     weight_decay = 0.0001
-    weight_l2 = sum(
-        jnp.sum(x**2) for x in weight_penalty_params if x.ndim > 1
-    )
+    weight_l2 = sum(jnp.sum(x**2) for x in weight_penalty_params if x.ndim > 1)
     weight_penalty = weight_decay * 0.5 * weight_l2
     loss = loss + weight_penalty
     loss = loss.mean()
@@ -148,7 +154,8 @@ def train_step(state, batch, learning_rate_fn):
 
   if dynamic_scale:
     grad_fn = dynamic_scale.value_and_grad(
-        loss_fn, has_aux=True,
+        loss_fn,
+        has_aux=True,
     )
     dynamic_scale, is_fin, aux, grads = grad_fn(state.params)
     # dynamic loss takes care of averaging gradients across replicas
@@ -160,9 +167,7 @@ def train_step(state, batch, learning_rate_fn):
   metrics['learning_rate'] = lr
 
   new_state = state.apply_gradients(
-      grads=grads,
-      batch_stats = new_model_state['batch_stats']
-  )
+      grads=grads, batch_stats=new_model_state['batch_stats'])
   if dynamic_scale:
     # if is_fin == False the gradients contain Inf/NaNs and optimizer state and
     # params should be restored (= skip this step).
@@ -173,8 +178,8 @@ def train_step(state, batch, learning_rate_fn):
             state.opt_state,
         ),
         params=jax.tree_util.tree_map(
-            functools.partial(jnp.where, is_fin), new_state.params, state.params
-        ),
+            functools.partial(jnp.where, is_fin), new_state.params,
+            state.params),
         dynamic_scale=dynamic_scale,
     )
     metrics['scale'] = dynamic_scale.scale
@@ -192,19 +197,20 @@ def prepare_tf_data(xs):
   """Convert a input batch from tf Tensors to numpy arrays."""
   local_device_count = jax.local_device_count()
 
-  def _prepare(x:tf.Tensor):
+  def _prepare(x: tf.Tensor):
     # Use _numpy() for zero-copy conversion between TF and NumPy.
     x = x._numpy()  # pylint: disable=protected-access
 
     # reshape (host_batch_size, height, width, 3) to
     # (local_devices, device_batch_size, height, width, 3)
-    return x.reshape((-1,) + x.shape[1:])
+    # return x.reshape((-1,) + x.shape[1:])
+    return x
 
   return jax.tree.map(_prepare, xs)
 
 
 def create_input_iter(
-    dataset_builder:tfds.core.DatasetBuilder,
+    dataset_builder: tfds.core.DatasetBuilder,
     host_batch_size,
     image_size,
     dtype,
@@ -213,7 +219,7 @@ def create_input_iter(
     shuffle_buffer_size,
     prefetch,
 ):
-  
+
   # data set chunk in context of current process/host index.
   # jax.process_index
   ds = input_pipeline.create_split(
@@ -226,10 +232,12 @@ def create_input_iter(
       shuffle_buffer_size=shuffle_buffer_size,
       prefetch=prefetch,
   )
-  
+
   it = map(prepare_tf_data, ds)
-  logging.info(f"[Process {jax.process_index()}] Returning prefetched iterator.")
+  logging.info(
+      f"[Process {jax.process_index()}] Returning prefetched iterator.")
   return it
+
 
 class TrainState(train_state.TrainState):
   batch_stats: Any
@@ -246,9 +254,8 @@ def save_checkpoint(state, workdir):
   checkpoints.save_checkpoint_multiprocess(workdir, state, step, keep=3)
 
 
-def create_train_state(
-    rng, config: ml_collections.ConfigDict, model, image_size, learning_rate_fn
-):
+def create_train_state(rng, config: ml_collections.ConfigDict, model,
+                       image_size, learning_rate_fn):
   """Create initial training state."""
   dynamic_scale = None
   platform = jax.local_devices()[0].platform
@@ -272,48 +279,36 @@ def create_train_state(
   )
   return state
 
-def create_device_mesh(num_devices: int | None = None) -> Mesh:
-  """Creates a 1D batch-parallel mesh using jax.make_mesh.
 
-  Args:
-    num_devices: The total number of devices to use for the mesh dimension.
-      If None, uses all available devices.
+def create_device_mesh() -> Mesh:
+  """Creates a 1D batch-parallel mesh using all available devices.
 
   Returns:
-    A jax.sharding.Mesh object configured for 1D batch parallelism.
-
-  Raises:
-      ValueError: If num_devices requested exceeds available devices.
+    A jax.sharding.Mesh object configured for 1D batch parallelism using
+    all detected devices across hosts.
   """
-  available_devices = jax.device_count()
+  devices = jax.devices()  # Get all devices across hosts
+  mesh_size = len(devices)
+  if mesh_size == 0:
+    raise ValueError("No devices found by JAX.")
 
-  if num_devices is None:
-    mesh_size = available_devices
-    logging.info('Creating mesh with all available devices: %d', mesh_size)
-  elif num_devices > available_devices:
-       raise ValueError(
-           f"Requested num_devices ({num_devices}) exceeds the number of "
-           f"available devices ({available_devices})."
-       )
-  else:
-       mesh_size = num_devices
-       logging.info('Creating mesh with %d devices.', mesh_size)
+  logging.info('Creating 1D mesh with all available devices: %d', mesh_size)
 
-  # axis_shapes, axis_names = (mesh_size,), ('data',)
+  # Define the shape of the mesh (1D)
+  mesh_shape = (mesh_size,)
+  # Reshape the full devices list to match the mesh shape
+  device_array = np.asarray(devices).reshape(mesh_shape)
+  # Define the axis name for the 1D mesh
+  mesh_axis_names = ('batch',)
+  # Create the mesh
+  mesh = Mesh(device_array, mesh_axis_names)
 
-  # Create the mesh using jax.make_mesh
-  # It automatically selects the devices (up to mesh_size) and arranges them.
-  mesh = Mesh(np.asarray(jax.devices(), dtype=object), ['batch'])
-
-  logging.info('Created mesh: %s with devices: %s', mesh, mesh.devices)
+  logging.info('Created mesh: %s with shape %s', mesh, mesh_shape)
   return mesh
 
-  
 
-
-def train_and_evaluate(
-    config: ml_collections.ConfigDict, workdir: str
-) -> TrainState:
+def train_and_evaluate(config: ml_collections.ConfigDict,
+                       workdir: str) -> TrainState:
   """Execute model training and evaluation loop.
 
   Args:
@@ -324,20 +319,21 @@ def train_and_evaluate(
     Final TrainState.
   """
 
+  # 1. Initial setup (writer, rng, image_size)
   writer = metric_writers.create_default_writer(
-      logdir=workdir, just_logging=jax.process_index() != 0
-  )
-
+      logdir=workdir, just_logging=jax.process_index() != 0)
   rng = random.key(0)
-
   image_size = 224
-  mesh = create_device_mesh()
-  if config.batch_size % jax.device_count() > 0:
+
+  # 2. Batch size checks
+  num_devices = jax.device_count()
+  num_processes = jax.process_count()
+  if config.batch_size % num_devices > 0:
     raise ValueError('Batch size must be divisible by the number of devices')
-  local_batch_size = config.batch_size // jax.process_count()
+  host_batch_size = config.batch_size // num_processes
 
+  # 3. Platform, dtype setup
   platform = jax.local_devices()[0].platform
-
   if config.half_precision:
     if platform == 'tpu':
       input_dtype = tf.bfloat16
@@ -345,11 +341,12 @@ def train_and_evaluate(
       input_dtype = tf.float16
   else:
     input_dtype = tf.float32
-    
+
+  # 4. Dataset iterators setup
   dataset_builder = tfds.builder(config.dataset)
   train_iter = create_input_iter(
       dataset_builder,
-      local_batch_size,
+      host_batch_size,
       image_size,
       input_dtype,
       train=True,
@@ -359,7 +356,7 @@ def train_and_evaluate(
   )
   eval_iter = create_input_iter(
       dataset_builder,
-      local_batch_size,
+      host_batch_size,
       image_size,
       input_dtype,
       train=False,
@@ -368,9 +365,9 @@ def train_and_evaluate(
       prefetch=config.prefetch,
   )
 
+  # 5. Step calculations
   steps_per_epoch = (
-      dataset_builder.info.splits['train'].num_examples // config.batch_size
-  )
+      dataset_builder.info.splits['train'].num_examples // config.batch_size)
 
   if config.num_train_steps <= 0:
     num_steps = int(steps_per_epoch * config.num_epochs)
@@ -379,125 +376,169 @@ def train_and_evaluate(
 
   if config.steps_per_eval == -1:
     num_validation_examples = dataset_builder.info.splits[
-        'validation'
-    ].num_examples
+        'validation'].num_examples
     steps_per_eval = num_validation_examples // config.batch_size
   else:
     steps_per_eval = config.steps_per_eval
-
   steps_per_checkpoint = steps_per_epoch * 10
 
+  # 6. Learning rate calculation
   base_learning_rate = config.learning_rate * config.batch_size / 256.0
-  with mesh:
-    model_cls = getattr(models, config.model)
-    model = create_model(
-        model_cls=model_cls, half_precision=config.half_precision
-    )
 
-    learning_rate_fn = create_learning_rate_fn(
-        config, base_learning_rate, steps_per_epoch
-    )
-    
-    state = create_train_state(rng, config, model, image_size, learning_rate_fn)
-    # orbax checkpointing
-    options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
-    mngr = ocp.CheckpointManager(
-        workdir, options=options
-    )
-    restore_args = orbax_utils.restore_args_from_target(target=state)
-    latest_step = mngr.latest_step()
-    if latest_step is not None:
-        logging.info('Restoring checkpoint from step %d', latest_step)
-        state = mngr.restore(
-            latest_step,
-            args=ocp.args.StandardRestore(state),
-            restore_kwargs={'restore_args': restore_args}
-        )
-    # state = restore_checkpoint(state, workdir)
-    # step_offset > 0 if restarting from checkpoint
-    step_offset = int(state.step)
-    if step_offset < 0:
-        logging.warning('Found negative step offset %d, resetting to 0.', step_offset)
-        step_offset = 0
-        
-    # train
-    # with mesh:
+  # 7. Mesh and Sharding Definitions
+  mesh = create_device_mesh()
+  state_named_sharding = NamedSharding(mesh, PartitionSpec())
+  data_named_sharding = NamedSharding(mesh, PartitionSpec('batch'))
+
+  # 8. Model, LR function creation
+  model_cls = getattr(models, config.model)
+  model = create_model(
+      model_cls=model_cls, half_precision=config.half_precision)
+
+  learning_rate_fn = create_learning_rate_fn(config, base_learning_rate,
+                                             steps_per_epoch)
+
+  # 9. Abstract State Creation
+  abstract_state = create_train_state(rng, config, model, image_size,
+                                      learning_rate_fn)
+
+  # 10. Orbax Checkpointing Setup (using abstract state)
+  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+  mngr = ocp.CheckpointManager(workdir, options=options)
+
+  # Restore args use abstract state + mesh
+  restore_args = orbax_utils.restore_args_from_target(abstract_state)
+  latest_step = mngr.latest_step()
+  initial_state = abstract_state
+  if latest_step is not None:
+    logging.info('Restoring checkpoint from step %d', latest_step)
+    # Restore using abstract state as structure definition
+    restored_state_abstract = mngr.restore(
+        latest_step,
+        args=ocp.args.StandardRestore(
+            abstract_state),  # Abstract target structure
+        restore_kwargs={'restore_args': restore_args})
+    if restored_state_abstract:
+      initial_state = restored_state_abstract
+      logging.info('Successfully restored checkpoint.')
+    else:
+      logging.warning('Failed to restore checkpoint at step %d.', latest_step)
+      latest_step = 0  # Reset step if restore fails
+
+  # 11. Calculate Step Offset
+  step_offset = int(latest_step or 0)
+
+  # 12. Determine Final 'state' Variable - New step
+  state = initial_state
+
+  with mesh:
     p_train_step = jax.jit(
-      functools.partial(train_step, learning_rate_fn=learning_rate_fn),
-      in_shardings=(None, NamedSharding(mesh,PartitionSpec('batch'))),
-      out_shardings=(None, None),
+        functools.partial(train_step, learning_rate_fn=learning_rate_fn),
+        in_shardings=(state_named_sharding, data_named_sharding),
+        out_shardings=(state_named_sharding, state_named_sharding),
     )
     p_eval_step = jax.jit(
-      eval_step,
-      in_shardings=(None, NamedSharding(mesh,PartitionSpec('batch'))),
-      out_shardings=None,
+        eval_step,
+        in_shardings=(state_named_sharding, data_named_sharding),
+        out_shardings=state_named_sharding,
     )
     train_metrics = []
     hooks = []
     if jax.process_index() == 0 and config.profile:
       hooks += [
           periodic_actions.Profile(
-              num_profile_steps=3, profile_duration_ms=None, logdir=workdir
-          )
+              num_profile_steps=3, profile_duration_ms=None, logdir=workdir)
       ]
       train_metrics_last_t = time.time()
       logging.info('Initial compilation, this might take some minutes...')
-      for step, batch in zip(range(step_offset, num_steps), train_iter):
+      for step in range(step_offset, num_steps):
+        try:
+          batch_np = next(train_iter)
+        except StopIteration:
+          logging.warning(...)
+          break
+        batch = multihost_utils.host_local_array_to_global_array(
+            batch_np, mesh, data_named_sharding.spec)
         state, metrics = p_train_step(state, batch)
         jax.effects_barrier()
         print(f"[Step {step}] Returned from pjit_train_step.")
-        for h in hooks:
-          h(step)
+        if jax.process_index() == 0:
+          for h in hooks:
+            h(step)
         if step == step_offset:
           logging.info('Initial compilation completed.')
 
-        if config.get('log_every_steps'):
-          train_metrics.append(metrics)
-          if (step + 1) % config.log_every_steps == 0:
-            train_metrics = common_utils.get_metrics(train_metrics)
+        if config.get('log_every_steps') and (step +
+                                              1) % config.log_every_steps == 0:
+          metrics_host = jax.device_get(metrics)
+          if jax.process_index() == 0:
+            train_metrics.append(metrics_host)
+            summary_metrics = common_utils.get_metrics(train_metrics)
             summary = {
-                f'train_{k}': v
-                for k, v in jax.tree_util.tree_map(
-                    lambda x: x.mean(), train_metrics
-                ).items()
+                f'train_{k}': v.mean() for k, v in summary_metrics.items()
             }
-            summary['steps_per_second'] = config.log_every_steps / (
-                time.time() - train_metrics_last_t
-            )
+            current_time = time.time()
+            steps_per_sec = config.log_every_steps / (
+                current_time - train_metrics_last_t)
+            summary['steps_per_second'] = steps_per_sec
             writer.write_scalars(step + 1, summary)
             train_metrics = []
-            train_metrics_last_t = time.time()
+            train_metrics_last_t = current_time
 
         if (step + 1) % steps_per_epoch == 0:
           epoch = step // steps_per_epoch
+          logging.info('Starting evaluation for epoch %d...', epoch)
           eval_metrics = []
-
-          for _ in range(steps_per_eval):
-            eval_batch = next(eval_iter)
+          eval_step_count = 0
+          current_eval_iter = create_input_iter(
+              dataset_builder,  # The tfds.builder object
+              host_batch_size,  # Batch size per host
+              image_size,  # Image size (e.g., 224)
+              input_dtype,  # Input dtype (e.g., tf.float32)
+              train=False,  # Specify False for evaluation split/preprocessing
+              cache=config.cache,  # Use cache setting from config
+              shuffle_buffer_size=None,  # No shuffling for evaluation
+              prefetch=config.prefetch  # Use prefetch setting from config
+          )
+          for eval_batch_np in current_eval_iter:
+            if eval_step_count >= steps_per_eval:
+              break
+            eval_batch = multihost_utils.host_local_array_to_global_array(
+                eval_batch_np, mesh, data_named_sharding.spec)
             metrics = p_eval_step(state, eval_batch)
-            eval_metrics.append(metrics)
-          eval_metrics = common_utils.get_metrics(eval_metrics)
-          summary = jax.tree_util.tree_map(lambda x: x.mean(), eval_metrics)
-          logging.info(
-              'eval epoch: %d, loss: %.4f, accuracy: %.2f',
-              epoch,
-              summary['loss'],
-              summary['accuracy'] * 100,
-          )
-          writer.write_scalars(
-              step + 1, {f'eval_{key}': val for key, val in summary.items()}
-          )
-          writer.flush()
-          
+            if jax.process_index() == 0:
+              eval_metrics.append(jax.device_get(metrics))
+            eval_step_count += 1
+            del current_eval_iter
+
+            if jax.process_index() == 0:
+              eval_metrics = common_utils.get_metrics(eval_metrics)
+              summary = {f'eval_{k}': v.mean() for k, v in eval_metrics.items()}
+              logging.info(
+                  'eval epoch: %d, loss: %.4f, accuracy: %.2f',
+                  epoch,
+                  summary['loss'],
+                  summary['accuracy'] * 100,
+              )
+              writer.write_scalars(step + 1, {
+                  f'eval_{key}': val for key, val in summary.items()
+              })
+              writer.flush()
+
         # === Orbax Checkpoint Saving ===
         if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
           # save_checkpoint(state, workdir)
           save_step = step + 1
           save_args = orbax_utils.save_args_from_target(state)
           logging.info('Saving checkpoint step %d.', save_step)
-          mngr.save(save_step, args=ocp.args.StandardSave(state), save_kwargs={'save_args': save_args})
-          mngr.wait_until_finished() # Wait for async save to complete
+          mngr.save(
+              save_step,
+              args=ocp.args.StandardSave(state),
+              save_kwargs={'save_args': save_args})
+          mngr.wait_until_finished()  # Wait for async save to complete
+          logging.info('Finished saving checkpoint step %d.', save_step)
   # Wait until computations are done before exiting
+  jax.block_until_ready(state)
   jax.random.normal(jax.random.key(0), ()).block_until_ready()
   mngr.close()
   return state
