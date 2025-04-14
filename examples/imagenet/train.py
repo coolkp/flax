@@ -318,6 +318,12 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   Returns:
     Final TrainState.
   """
+  
+  workdir_path = Path(workdir)
+  # Option A: Let all processes attempt creation (safe with exist_ok=True on shared FS)
+  workdir_path.mkdir(parents=True, exist_ok=True)
+  logging.info(f"[Process {jax.process_index()}] Ensured workdir exists: {workdir}")
+
 
   # 1. Initial setup (writer, rng, image_size)
   writer = metric_writers.create_default_writer(
@@ -403,7 +409,8 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
                                       learning_rate_fn)
 
   # 10. Orbax Checkpointing Setup (using abstract state)
-  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True,enable_async_checkpointing=True)
+  options = ocp.CheckpointManagerOptions(create=True,enable_async_checkpointing=True)
+  logging.info("Checkpointing options created")
   mngr = ocp.CheckpointManager(workdir, options=options)
 
   # Restore args use abstract state + mesh
