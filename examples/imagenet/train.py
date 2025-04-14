@@ -413,7 +413,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
   options = ocp.CheckpointManagerOptions(create=True,enable_async_checkpointing=True)
   logging.info("Checkpointing options created")
   mngr = ocp.CheckpointManager(workdir, options=options)
-
+  logging.info("Checkpointing manager created")
   # Restore args use abstract state + mesh
   restore_args = orbax_utils.restore_args_from_target(abstract_state)
   latest_step = mngr.latest_step()
