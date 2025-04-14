@@ -403,7 +403,7 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
                                       learning_rate_fn)
 
   # 10. Orbax Checkpointing Setup (using abstract state)
-  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True)
+  options = ocp.CheckpointManagerOptions(max_to_keep=3, create=True,enable_async_checkpointing=True)
   mngr = ocp.CheckpointManager(workdir, options=options)
 
   # Restore args use abstract state + mesh
